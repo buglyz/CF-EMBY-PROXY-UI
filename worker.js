@@ -28,7 +28,9 @@ const Config = {
         JwtExpiry: 60 * 60 * 24 * 7,
         LoginLockDuration: 900,
         MaxLoginAttempts: 5,
-        CacheTTL: 60000
+        CacheTTL: 60000,
+        RouteCacheTTL: 60,
+        RouteProbeTimeout: 1500
     }
 };
 
@@ -192,11 +194,17 @@ const Database = {
             case "import":
                 const nodesToSave = data.action === "save" ? [data] : data.nodes;
                 for (const n of nodesToSave) {
-                    if (n.name && n.target) {
+                    const hasUnified = !!n.target;
+                    const hasSplit = !!n.frontend && !!n.backend;
+                    const mode = (String(n.mode || "").toLowerCase() === "split" || hasSplit) ? "split" : "unified";
+                    if (n.name && (hasUnified || hasSplit)) {
                         const val = {
                             secret: n.secret || n.path || "",
-                            target: n.target,
-                            tag: n.tag || "" 
+                            target: n.target || "",
+                            tag: n.tag || "",
+                            mode,
+                            frontend: n.frontend || "",
+                            backend: n.backend || ""
                         };
                         await kv.put(`${this.PREFIX}${n.name}`, JSON.stringify(val));
                         await invalidate(n.name);
@@ -244,9 +252,78 @@ const Database = {
 // ============================================================================
 // 3. PROXY MODULE (V17.5 API & Cache 深度优化版)
 // ============================================================================
+const Router = {
+    PING_PATH: "/emby/System/Ping",
+
+    parsePool(value) {
+        if (!value) return [];
+        if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
+        return String(value)
+            .split(/[\n,]/)
+            .map(v => v.trim())
+            .filter(Boolean);
+    },
+
+    async selectBest(candidates, request, ctx, cacheKey) {
+        if (!candidates || candidates.length === 0) return "";
+        if (candidates.length === 1) return candidates[0];
+
+        const country = request.headers.get("cf-ipcountry") || "XX";
+        const key = `https://internal-rtt-cache/${encodeURIComponent(cacheKey)}/${country}`;
+        const cache = caches.default;
+
+        const cached = await cache.match(key);
+        if (cached) {
+            try {
+                const data = await cached.json();
+                if (data && data.target && candidates.includes(data.target)) return data.target;
+            } catch { }
+        }
+
+        const results = await Promise.all(candidates.map(c => this.probe(c)));
+        const ok = results.filter(r => r.ok).sort((a, b) => a.rtt - b.rtt);
+        const best = ok.length ? ok[0].url : candidates[0];
+
+        const resp = new Response(JSON.stringify({ target: best, ts: Date.now() }), {
+            headers: { "Cache-Control": `public, max-age=${Config.Defaults.RouteCacheTTL}` }
+        });
+        ctx.waitUntil(cache.put(key, resp));
+        return best;
+    },
+
+    async probe(baseUrl) {
+        const start = Date.now();
+        try {
+            const url = new URL(this.PING_PATH, baseUrl);
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort("timeout"), Config.Defaults.RouteProbeTimeout);
+            const resp = await fetch(url.toString(), {
+                method: "GET",
+                headers: { "User-Agent": "cf-emby-proxy-check" },
+                signal: controller.signal
+            });
+            clearTimeout(timeout);
+            if (!resp.ok) return { url: baseUrl, ok: false, rtt: Number.MAX_SAFE_INTEGER };
+            return { url: baseUrl, ok: true, rtt: Date.now() - start };
+        } catch {
+            return { url: baseUrl, ok: false, rtt: Number.MAX_SAFE_INTEGER };
+        }
+    }
+};
+
 const Proxy = {
-    async handle(request, node, path, name, key) {
-        const targetBase = new URL(node.target);
+    isStaticRequest(path, request) {
+        return (GLOBALS.Regex.StaticExt.test(path) || GLOBALS.Regex.EmbyImages.test(path)) && request.method === 'GET';
+    },
+
+    isFrontendPath(path, request) {
+        const lowerPath = (path || "").toLowerCase();
+        if (lowerPath.startsWith('/web')) return true;
+        return GLOBALS.Regex.StaticExt.test(path);
+    },
+
+    async handle(request, node, path, name, key, targetUrl) {
+        const targetBase = new URL(targetUrl || node.target);
         const finalUrl = new URL(path, targetBase);
         finalUrl.search = new URL(request.url).search;
 
@@ -260,7 +337,7 @@ const Proxy = {
         const isStreaming = GLOBALS.Regex.Streaming.test(path);
         // [API优化] 判定是否为静态资源 (包含图片、字幕、网页资源)
         // 注意：Emby 的图片通常没有后缀，而是 /Items/xxx/Images/Primary，依靠 Regex.EmbyImages 识别
-        const isStatic = (GLOBALS.Regex.StaticExt.test(path) || GLOBALS.Regex.EmbyImages.test(path)) && request.method === 'GET';
+        const isStatic = this.isStaticRequest(path, request);
 
         // 2. 构建请求头
         const newHeaders = new Headers(request.headers);
@@ -487,8 +564,26 @@ ${this.getHead("Admin")}
             </div>
             
             <div style="margin-bottom:10px">
+                <label style="display:block;font-size:12px;color:var(--ts);margin-bottom:4px" id="l-mode">Mode</label>
+                <select id="inMode" style="width:100%" onchange="App.onModeChange(this.value)">
+                    <option id="opt-mode-unified" value="unified">Unified</option>
+                    <option id="opt-mode-split" value="split">Split</option>
+                </select>
+            </div>
+
+            <div id="sec-target-unified" style="margin-bottom:10px">
                 <label style="display:block;font-size:12px;color:var(--ts);margin-bottom:4px" id="l-target">Target</label>
                 <input id="inTarget" style="width:100%">
+            </div>
+
+            <div id="sec-target-frontend" style="margin-bottom:10px;display:none">
+                <label style="display:block;font-size:12px;color:var(--ts);margin-bottom:4px" id="l-frontend">Frontend</label>
+                <input id="inFrontend" style="width:100%">
+            </div>
+
+            <div id="sec-target-backend" style="margin-bottom:10px;display:none">
+                <label style="display:block;font-size:12px;color:var(--ts);margin-bottom:4px" id="l-backend">Backend</label>
+                <input id="inBackend" style="width:100%">
             </div>
             
             <div style="margin-bottom:15px">
@@ -658,28 +753,34 @@ ${this.getHead("Admin")}
 
         const TEXTS = {
             'en': {
-                new: "New Node", namePh: "e.g. HK", targetPh: "http://1.2.3.4:8096",
+                new: "New Node", namePh: "e.g. HK", targetPh: "http://1.2.3.4:8096", frontendPh: "http://frontend:8096", backendPh: "http://backend:8096",
                 tagPh: "e.g. VIP", secPh: "Optional", deploy: "Deploy", nodes: "Nodes",
                 export: "Export", import: "Import", noNodes: "No nodes", copy: "Copied!", copied: "Copied!", del: "Del",
                 search: "Search Name or Tag...", batchDel: "Delete Selected", batchTag: "Set Tag", selected: "Selected: ",
                 thName: "Name", thTarget: "Target", thProxy: "Proxy", thAction: "Action", inputTag: "Enter Tag Name:",
-                lName: "Name", lTag: "Tag", lTarget: "Target Address", lSec: "Secret Path"
+                lName: "Name", lTag: "Tag", lTarget: "Target Address", lSec: "Secret Path",
+                lMode: "Mode", lFrontend: "Frontend Address", lBackend: "Backend Address",
+                modeUnified: "Unified", modeSplit: "Split"
             },
             'zh-Hans': {
-                new: "新建节点", namePh: "例如 HK", targetPh: "http://1.2.3.4:8096",
+                new: "新建节点", namePh: "例如 HK", targetPh: "http://1.2.3.4:8096", frontendPh: "http://frontend:8096", backendPh: "http://backend:8096",
                 tagPh: "例如 VIP", secPh: "可选", deploy: "部署", nodes: "节点列表",
                 export: "导出配置", import: "导入配置", noNodes: "暂无节点", copy: "已复制!", copied: "已复制!", del: "删除",
                 search: "搜索名称或标签...", batchDel: "批量删除", batchTag: "批量设置标签", selected: "已选: ",
                 thName: "名称", thTarget: "目标", thProxy: "代理地址", thAction: "操作", inputTag: "输入标签名称:",
-                lName: "名称", lTag: "标签", lTarget: "目标地址", lSec: "私密路径"
+                lName: "名称", lTag: "标签", lTarget: "目标地址", lSec: "私密路径",
+                lMode: "模式", lFrontend: "前端地址", lBackend: "后端地址",
+                modeUnified: "统一", modeSplit: "前后端分离"
             },
             'zh-Hant': {
-                new: "新建節點", namePh: "例如 HK", targetPh: "http://1.2.3.4:8096",
+                new: "新建節點", namePh: "例如 HK", targetPh: "http://1.2.3.4:8096", frontendPh: "http://frontend:8096", backendPh: "http://backend:8096",
                 tagPh: "例如 VIP", secPh: "可選", deploy: "部署", nodes: "節點列表",
                 export: "導出配置", import: "導入配置", noNodes: "暫無節點", copy: "已複製!", copied: "已複製!", del: "刪除",
                 search: "搜索名稱或標籤...", batchDel: "批量刪除", batchTag: "批量設置標籤", selected: "已選: ",
                 thName: "名稱", thTarget: "目標", thProxy: "代理地址", thAction: "操作", inputTag: "輸入標籤名稱:",
-                lName: "名稱", lTag: "標籤", lTarget: "目標地址", lSec: "私密路徑"
+                lName: "名稱", lTag: "標籤", lTarget: "目標地址", lSec: "私密路徑",
+                lMode: "模式", lFrontend: "前端位址", lBackend: "後端位址",
+                modeUnified: "統一", modeSplit: "前後端分離"
             }
         };
 
@@ -699,6 +800,7 @@ ${this.getHead("Admin")}
                 else this.lang = 'en';
 
                 this.updateTexts();
+                this.onModeChange($('#inMode').value || 'unified');
                 
                 const cfg = await API.req({action:'loadConfig'});
                 if(cfg) {
@@ -957,9 +1059,14 @@ ${this.getHead("Admin")}
                 const t = TEXTS[this.lang];
                 $('#t-new').innerText = t.new;
                 $('#l-name').innerText = t.lName; $('#inName').placeholder = t.namePh;
-                $('#l-target').innerText = t.lTarget; $('#inTarget').placeholder = t.targetPh;
                 $('#l-tag').innerText = t.lTag; $('#inTag').placeholder = t.tagPh;
                 $('#l-sec').innerText = t.lSec; $('#inSec').placeholder = t.secPh;
+                $('#l-mode').innerText = t.lMode;
+                $('#opt-mode-unified').innerText = t.modeUnified;
+                $('#opt-mode-split').innerText = t.modeSplit;
+                $('#l-target').innerText = t.lTarget; $('#inTarget').placeholder = t.targetPh;
+                $('#l-frontend').innerText = t.lFrontend; $('#inFrontend').placeholder = t.frontendPh;
+                $('#l-backend').innerText = t.lBackend; $('#inBackend').placeholder = t.backendPh;
                 
                 $('#t-deploy').innerText = t.deploy;
                 $('#t-nodes').innerText = t.nodes;
@@ -972,6 +1079,13 @@ ${this.getHead("Admin")}
                 $('#th-target').innerText = t.thTarget;
                 $('#th-proxy').innerText = t.thProxy;
                 $('#th-action').innerText = t.thAction;
+            },
+
+            onModeChange(mode) {
+                const isSplit = mode === 'split';
+                $('#sec-target-unified').style.display = isSplit ? 'none' : 'block';
+                $('#sec-target-frontend').style.display = isSplit ? 'block' : 'none';
+                $('#sec-target-backend').style.display = isSplit ? 'block' : 'none';
             },
 
             async refresh(){
@@ -1064,6 +1178,8 @@ ${this.getHead("Admin")}
                     const safeName = this.escapeHtml(n.name); // 之前这里报错，因为 this.escapeHtml 不存在
                     const safeTag = this.escapeHtml(n.tag);
                     const safeTarget = this.escapeHtml(n.target);
+                    const safeFrontend = this.escapeHtml(n.frontend);
+                    const safeBackend = this.escapeHtml(n.backend);
                     const safeSecret = this.escapeHtml(n.secret);
 
                     // ========================================================
@@ -1081,7 +1197,11 @@ ${this.getHead("Admin")}
                     const tagHtml = n.tag ? \`<span class="tag-badge tag-blue">\${safeTag}</span>\` : '';
                     const secHtml = n.secret ? \`<span title="Secret" style="margin-left:5px;color:var(--d97706)">\${Icons.lock}</span>\` : '';
                     
-                    const targetDisplay = showTarget ? safeTarget : '••••••••••••';
+                    const mode = String(n.mode || (n.frontend || n.backend ? 'split' : 'unified')).toLowerCase();
+                    const targetText = mode === 'split'
+                        ? 'F:' + safeFrontend + ' | B:' + safeBackend
+                        : safeTarget;
+                    const targetDisplay = showTarget ? targetText : '••••••••••••';
                     const targetClass = showTarget ? '' : 'color:var(--ts);letter-spacing:2px';
                     
                     const proxyDisplay = showProxy ? proxyUrl : '••••••••••••';
@@ -1121,10 +1241,23 @@ ${this.getHead("Admin")}
             },
 
             async save(){
-                const name=$('#inName').value, target=$('#inTarget').value, secret=$('#inSec').value, tag=$('#inTag').value;
-                if(!name||!target) return alert('Required');
-                await API.req({action:'save',name,target,secret,tag});
-                $('#inName').value=''; $('#inTarget').value=''; $('#inSec').value=''; $('#inTag').value='';
+                const name=$('#inName').value.trim();
+                const mode=$('#inMode').value || 'unified';
+                const target=$('#inTarget').value.trim();
+                const frontend=$('#inFrontend').value.trim();
+                const backend=$('#inBackend').value.trim();
+                const secret=$('#inSec').value.trim();
+                const tag=$('#inTag').value.trim();
+
+                if(!name) return alert('Required');
+                if(mode === 'split') {
+                    if(!frontend || !backend) return alert('Required');
+                } else {
+                    if(!target) return alert('Required');
+                }
+
+                await API.req({action:'save',name,target,secret,tag,mode,frontend,backend});
+                $('#inName').value=''; $('#inTarget').value=''; $('#inFrontend').value=''; $('#inBackend').value=''; $('#inSec').value=''; $('#inTag').value='';
                 this.refresh();
             },
 
@@ -1305,7 +1438,24 @@ export default {
                     }
 
                     // 5. 透传请求给 Emby
-                    return Proxy.handle(request, nodeData, remaining, root, secret);
+                    let mode = String(nodeData.mode || "").toLowerCase();
+                    if (mode !== "split") mode = "unified";
+
+                    let poolValue = nodeData.target;
+                    let poolKey = "target";
+                    if (mode === "split") {
+                        const useFrontend = Proxy.isFrontendPath(remaining, request);
+                        poolValue = useFrontend ? nodeData.frontend : nodeData.backend;
+                        poolKey = useFrontend ? "frontend" : "backend";
+                    }
+
+                    const candidates = Router.parsePool(poolValue);
+                    const targetUrl = await Router.selectBest(candidates, request, ctx, `${root}:${poolKey}`);
+                    if (!targetUrl) {
+                        return new Response("Node target missing", { status: 502 });
+                    }
+
+                    return Proxy.handle(request, nodeData, remaining, root, secret, targetUrl);
                 }
             }
         }

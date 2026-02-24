@@ -1,6 +1,6 @@
 ## CF-EMBY-PROXY-UI 最新版本：V17.6
 
-## 27号回家修改更新项目
+
 
 ## 意见反馈群或者讨论群 https://t.me/+NhDf7qMxH4ZlODY9 
 
